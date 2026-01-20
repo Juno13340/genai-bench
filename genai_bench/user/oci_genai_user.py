@@ -130,6 +130,9 @@ class OCIGenAIUser(BaseUser):
             presence_penalty=user_request.additional_request_params.get(
                 "presence_penalty", None
             ),
+            reasoning_effort=user_request.additional_request_params.get(
+                "reasoning_effort", None
+            ),
             num_generations=1,
         )
 
@@ -260,21 +263,30 @@ class OCIGenAIUser(BaseUser):
                     # Extract text content from OCI GenAI format
                     message = parsed_data.get("message", {})
                     content_array = message.get("content", [])
+                    reasoning_content_array = message.get("reasoning_content", [])
+
+                    # Handle both regular content and reasoning_content
+                    # Check content first, then reasoning_content (same as OpenAI's approach)
+                    text_segment = ""
                     if content_array and len(content_array) > 0:
                         text_segment = content_array[0].get("text", "")
-                        if text_segment:
-                            # Capture the time at the first token
-                            if not time_at_first_token:
-                                time_at_first_token = time.monotonic()
-                                logger.debug(
-                                    f"First token received at: {time_at_first_token}"
-                                )
-                            generated_text += text_segment
-                            streaming_events_count += 1  # each event contains one token
+                    elif reasoning_content_array and len(reasoning_content_array) > 0:
+                        text_segment = reasoning_content_array[0].get("text", "")
+
+                    if text_segment:
+                        # Capture the time at the first token
+                        # TTFT should be triggered by reasoning_content or content
+                        if not time_at_first_token:
+                            time_at_first_token = time.monotonic()
                             logger.debug(
-                                f"Text: '{text_segment}', "
-                                f"streaming events count: {streaming_events_count}"
+                                f"First token received at: {time_at_first_token}"
                             )
+                        generated_text += text_segment
+                        streaming_events_count += 1  # each event contains one token
+                        logger.debug(
+                            f"Text: '{text_segment}', "
+                            f"streaming events count: {streaming_events_count}"
+                        )
                     # Track the previous data for debugging purposes
                     previous_data = parsed_data
                 else:
@@ -297,7 +309,14 @@ class OCIGenAIUser(BaseUser):
         try:
             total_tokens = usage_data["totalTokens"]
             prompt_tokens = usage_data["promptTokens"]
-            tokens_received = total_tokens - prompt_tokens
+            # Use completionTokens directly if available
+            # This ensures reasoning tokens are not included in the completion count
+            completion_tokens = usage_data.get("completionTokens")
+            if completion_tokens is not None:
+                tokens_received = completion_tokens
+            else:
+                # Fallback for older API versions that don't provide completionTokens
+                tokens_received = total_tokens - prompt_tokens
 
         except (KeyError, TypeError):
             # Fallback: use streaming events count if usage data is unavailable

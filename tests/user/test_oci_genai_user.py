@@ -421,3 +421,133 @@ def test_on_start_without_auth():
 
     with pytest.raises(ValueError, match="Auth is required for OCIGenAIUser"):
         user.on_start()
+
+
+@patch("genai_bench.user.oci_genai_user.GenerativeAiInferenceClient")
+def test_chat_with_reasoning_content(mock_client_class, test_genai_user):
+    """Test chat with reasoning_content in streaming response."""
+    mock_client_instance = mock_client_class.return_value
+    mock_client_instance.chat.return_value.status = 200
+
+    # Prepare test streaming response with reasoning_content
+    reasoning_msg = (
+        '{"message": {"role": "ASSISTANT", '
+        '"reasoning_content": [{"type": "TEXT", "text": "Let me think..."}]}}'
+    )
+    content_msg = (
+        '{"message": {"role": "ASSISTANT", '
+        '"content": [{"type": "TEXT", "text": "The answer is 42"}]}}'
+    )
+    usage_msg = (
+        '{"usage": {"totalTokens": 20, "promptTokens": 5, '
+        '"completionTokens": 10, "completionTokensDetails": {"reasoningTokens": 5}}}'
+    )
+
+    mock_client_instance.chat.return_value.data.events.return_value = iter(
+        [
+            MagicMock(data=reasoning_msg),
+            MagicMock(data=content_msg),
+            MagicMock(data='{"finishReason": "stop"}'),
+            MagicMock(data=usage_msg),
+        ]
+    )
+
+    test_genai_user.on_start()
+    test_genai_user.sample = lambda: UserChatRequest(
+        model="openai.gpt-oss-120b",
+        prompt="What is the answer?",
+        num_prefill_tokens=5,
+        additional_request_params={
+            "compartmentId": "ocid1.compartment.oc1..example",
+            "servingType": "ON_DEMAND",
+            "reasoning_effort": "MEDIUM",
+        },
+        max_tokens=20,
+    )
+
+    metrics_collector_mock = MagicMock()
+    test_genai_user.collect_metrics = metrics_collector_mock
+
+    response = test_genai_user.chat()
+
+    # Verify the response includes both reasoning and regular content
+    assert response.status_code == 200
+    assert response.generated_text == "Let me think...The answer is 42"
+    # Verify completionTokens is used (10), not totalTokens - promptTokens (15)
+    assert response.tokens_received == 10
+    assert response.time_at_first_token is not None
+
+
+@patch("genai_bench.user.oci_genai_user.GenerativeAiInferenceClient")
+def test_chat_reasoning_effort_parameter(mock_client_class, test_genai_user):
+    """Test that reasoning_effort parameter is passed to the API."""
+    mock_client_instance = mock_client_class.return_value
+    mock_client_instance.chat.return_value.status = 200
+    mock_client_instance.chat.return_value.data.events.return_value = iter([])
+
+    test_genai_user.on_start()
+    test_genai_user.sample = lambda: UserChatRequest(
+        model="openai.gpt-oss-120b",
+        prompt="Test prompt",
+        num_prefill_tokens=5,
+        additional_request_params={
+            "compartmentId": "ocid1.compartment.oc1..example",
+            "servingType": "ON_DEMAND",
+            "reasoning_effort": "HIGH",
+        },
+        max_tokens=10,
+    )
+
+    test_genai_user.chat()
+
+    # Verify reasoning_effort was included in the request
+    chat_request = mock_client_instance.chat.call_args[0][0].chat_request
+    assert chat_request.reasoning_effort == "HIGH"
+
+
+@patch("genai_bench.user.oci_genai_user.GenerativeAiInferenceClient")
+def test_chat_ttft_triggered_by_reasoning_content(mock_client_class, test_genai_user):
+    """Test that TTFT is triggered by reasoning_content (first token)."""
+    mock_client_instance = mock_client_class.return_value
+    mock_client_instance.chat.return_value.status = 200
+
+    # Only reasoning_content, no regular content
+    reasoning_msg = (
+        '{"message": {"role": "ASSISTANT", '
+        '"reasoning_content": [{"type": "TEXT", "text": "Thinking..."}]}}'
+    )
+    usage_msg = (
+        '{"usage": {"totalTokens": 10, "promptTokens": 5, '
+        '"completionTokens": 3, "completionTokensDetails": {"reasoningTokens": 2}}}'
+    )
+
+    mock_client_instance.chat.return_value.data.events.return_value = iter(
+        [
+            MagicMock(data=reasoning_msg),
+            MagicMock(data='{"finishReason": "stop"}'),
+            MagicMock(data=usage_msg),
+        ]
+    )
+
+    test_genai_user.on_start()
+    test_genai_user.sample = lambda: UserChatRequest(
+        model="openai.gpt-oss-120b",
+        prompt="Think about this",
+        num_prefill_tokens=5,
+        additional_request_params={
+            "compartmentId": "ocid1.compartment.oc1..example",
+            "servingType": "ON_DEMAND",
+        },
+        max_tokens=10,
+    )
+
+    metrics_collector_mock = MagicMock()
+    test_genai_user.collect_metrics = metrics_collector_mock
+
+    response = test_genai_user.chat()
+
+    # Verify TTFT was triggered by reasoning_content
+    assert response.time_at_first_token is not None
+    assert response.generated_text == "Thinking..."
+    # Verify completionTokens (3) is used, not totalTokens - promptTokens (5)
+    assert response.tokens_received == 3
